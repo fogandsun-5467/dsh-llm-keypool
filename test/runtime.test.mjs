@@ -125,3 +125,14 @@ test('expired cooling entries are pruned from the snapshot', () => {
   const snapshot = statusSnapshot()
   assert.equal(snapshot.cooling.some((entry) => entry.provider === 'vendor-c'), false)
 })
+
+test('the optional preferFirst flag is normalized and persisted', () => {
+  const on = writeStoredConfig({ ...GOOD, preferFirst: true })
+  assert.equal(on.preferFirst, true)
+  assert.equal(JSON.parse(readFileSync(process.env.DSH_KEYPOOL_CONFIG, 'utf8')).preferFirst, true)
+  assert.equal(readStoredConfig().preferFirst, true)
+  // A document without the flag keeps it off.
+  const off = writeStoredConfig(GOOD)
+  assert.equal(off.preferFirst, false)
+  assert.equal(JSON.parse(readFileSync(process.env.DSH_KEYPOOL_CONFIG, 'utf8')).preferFirst, false)
+})

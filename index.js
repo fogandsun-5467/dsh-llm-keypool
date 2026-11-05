@@ -48,9 +48,10 @@ import {
   storedConfigError,
   writeStoredConfig,
 } from './lib/runtime.js'
-import { readNonNegativeInt, readPositiveInt, readStringArray } from './lib/shared.js'
+import { readNonNegativeInt, readPositiveInt, readStringArray, normalizeRoutePools } from './lib/shared.js'
 import { apply as applyRoutePool } from './lib/route-pool.js'
 import { apply as applyKeyRotate } from './lib/key-rotate.js'
+import { createQuotaService, DEFAULT_CACHE_MS } from './lib/quota.js'
 
 /** Cordis plugin name (matches the package name so the browser half attaches). */
 export const name = '@nethiel/dsh-llm-keypool'
@@ -131,6 +132,7 @@ function routePoolOptions(config) {
     ...(config.patterns === undefined ? {} : { patterns: config.patterns }),
     ...(config.cooldownMs === undefined ? {} : { cooldownMs: config.cooldownMs }),
     ...(config.maxSwitchesPerTurn === undefined ? {} : { maxSwitchesPerTurn: config.maxSwitchesPerTurn }),
+    ...(config.preferFirst === undefined ? {} : { preferFirst: config.preferFirst }),
     ...(config.dryRun === undefined ? {} : { dryRun: config.dryRun }),
   }
 }
@@ -152,6 +154,20 @@ function keyRotateOptions(config) {
 }
 
 /**
+ * Behavior options for the quota reader: the nested `quota` object, or a flat
+ * legacy layout as a fallback.
+ * @param {Record<string, any>} config
+ */
+function quotaOptions(config) {
+  if (isPlainObject(config.quota)) return config.quota
+  return {
+    ...(config.quotaProviders === undefined ? {} : { providers: config.quotaProviders }),
+    ...(config.quotaCacheMs === undefined ? {} : { cacheMs: config.quotaCacheMs }),
+    ...(config.quotaEnabled === undefined ? {} : { enabled: config.quotaEnabled }),
+  }
+}
+
+/**
  * @param {any} ctx Cordis context.
  * @param {Record<string, any>} [config] this row's config.
  */
@@ -163,6 +179,39 @@ export function apply(ctx, config = {}) {
     cooldownMs: readNonNegativeInt(routePool.cooldownMs, 10 * 60_000),
     maxSwitchesPerTurn: readPositiveInt(routePool.maxSwitchesPerTurn, 3),
     ...(rowCodes === undefined ? {} : { codes: rowCodes }),
+    // Pool order as preference order (off unless the panel or the row says so).
+    preferFirst: routePool.preferFirst === true,
+  }
+
+  // ---- quota reader -------------------------------------------------------
+  // The pool knows *when* a provider ran out; the quota reader knows *how much
+  // is left*, so the panel can show it and the pool can fail over early.
+  const quota = quotaOptions(config)
+  const quotaEnabled = quota.enabled !== false
+  const quotaService = createQuotaService(ctx, {
+    providers: isPlainObject(quota.providers) ? quota.providers : {},
+    cacheMs: readNonNegativeInt(quota.cacheMs, DEFAULT_CACHE_MS),
+  })
+
+  /** The GUI-managed quota section, if the pool file has one. */
+  const guiQuota = () => {
+    const stored = readStoredConfig()
+    return stored?.quota ?? { enabled: true, cacheMs: DEFAULT_CACHE_MS, providers: {} }
+  }
+
+  /** Every provider worth reading a quota for. */
+  const quotaProviderIds = () => {
+    const ids = new Set()
+    const stored = readStoredConfig()
+    for (const pool of stored?.pools ?? []) {
+      for (const route of pool.routes ?? []) ids.add(route.provider)
+    }
+    for (const pool of normalizeRoutePools(rowFallback.pools)) {
+      for (const route of pool.routes) ids.add(route.provider)
+    }
+    for (const providerId of Object.keys(guiQuota().providers ?? {})) ids.add(providerId)
+    for (const providerId of Object.keys(isPlainObject(quota.providers) ? quota.providers : {})) ids.add(providerId)
+    return [...ids]
   }
 
   /** @param {import('node:http').ServerResponse} res */
@@ -241,10 +290,77 @@ export function apply(ctx, config = {}) {
     },
   }), 'llm-keypool: status route')
 
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: `${PREFIX}quota`,
+    handler: (req, res) => {
+      if (!isLoopback(req)) return sendJson(res, 403, { error: 'loopback only' })
+      if (req.method !== 'GET') return sendJson(res, 405, { error: 'GET only' })
+      ;(async () => {
+        const gui = guiQuota()
+        if (!quotaEnabled || gui.enabled === false) {
+          return sendJson(res, 200, { enabled: false, updatedAt: Date.now(), providers: [] })
+        }
+        const refresh = new URL(req.url ?? '/', 'http://localhost').searchParams.get('refresh') === '1'
+        const snapshot = await quotaService.snapshot({
+          force: refresh,
+          providers: quotaProviderIds(),
+          guiProviders: gui.providers ?? {},
+        })
+        sendJson(res, 200, {
+          enabled: true,
+          updatedAt: snapshot.updatedAt,
+          providers: snapshot.providers,
+        })
+      })().catch((error) => sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) }))
+    },
+  }), 'llm-keypool: quota route')
+
+  // Keep the quota cache warm so the pool can fail over before the provider
+  // starts rejecting requests. The reader's own TTL keeps the vendor calls
+  // rare (one refresh per cache window).
+  ctx.effect(() => {
+    const timer = setInterval(() => {
+      if (!quotaEnabled || guiQuota().enabled === false) return
+      const providers = quotaProviderIds()
+      if (providers.length === 0) return
+      quotaService.snapshot({ providers, guiProviders: guiQuota().providers ?? {} })
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error)
+          ctx.logger.warn(`llm-keypool: quota refresh failed: ${message}`)
+        })
+    }, 60_000)
+    // The refresher must not be the reason the host stays alive.
+    if (typeof timer.unref === 'function') timer.unref()
+    return () => clearInterval(timer)
+  }, 'llm-keypool: quota refresher')
+
   // ---- behavior, applied in this fiber (one Loader source for the package) ----
   // A behavior-initialisation failure must never take the panel API down with it.
   try {
-    applyRoutePool(ctx, routePool)
+    applyRoutePool(ctx, {
+      ...routePool,
+      quota: {
+        // The switch-over only follows the quota while the reader is enabled;
+        // a disabled reader must never steer the pool.
+        exhausted: (provider) => (quotaEnabled && guiQuota().enabled !== false ? quotaService.exhausted(provider) : false),
+        // How long a spent provider must stay out. The reader answers with the
+        // vendor's own reset time (the rest of the 5-hour token-plan window),
+        // so a quota failure parks the provider for hours, not minutes.
+        cooldownMs: async (provider) => {
+          if (!quotaEnabled || guiQuota().enabled === false) return undefined
+          const gui = guiQuota()
+          // Refresh first: the cached reading may predate the failure.
+          try {
+            await quotaService.refresh(provider, { guiProviders: gui.providers ?? {} })
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            ctx.logger.warn(`llm-keypool: quota refresh after failure failed: ${message}`)
+          }
+          return quotaService.cooldownMs(provider)
+        },
+      },
+    })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     ctx.logger.error(`llm-keypool: route-pool init failed: ${message}`)

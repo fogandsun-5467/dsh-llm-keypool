@@ -1,6 +1,6 @@
 {
   "name": "@nethiel/dsh-llm-keypool",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "DSH rotation pool: a sidebar panel to pick configured provider/model routes and fail over across them on quota errors, plus optional multi-key rotation.",
   "keywords": [
@@ -17,13 +17,13 @@
   "author": "NethielChou",
   "license": "MIT",
   "icon": "icon.svg",
-  "homepage": "https://github.com/NethielChou/dsh-llm-keypool#readme",
+  "homepage": "https://github.com/fogandsun-5467/dsh-llm-keypool#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NethielChou/dsh-llm-keypool.git"
+    "url": "git+https://github.com/fogandsun-5467/dsh-llm-keypool.git"
   },
   "bugs": {
-    "url": "https://github.com/NethielChou/dsh-llm-keypool/issues"
+    "url": "https://github.com/fogandsun-5467/dsh-llm-keypool/issues"
   },
   "engines": {
     "node": ">=22.12.0"
@@ -39,6 +39,7 @@
     "./route-pool": "./lib/route-pool.js",
     "./shared": "./lib/shared.js",
     "./runtime": "./lib/runtime.js",
+    "./quota": "./lib/quota.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
@@ -57,7 +58,7 @@
     "access": "public"
   },
   "scripts": {
-    "test": "node --test test/key-rotate.test.mjs test/route-pool.test.mjs test/runtime.test.mjs test/panel-api.test.mjs test/client-module.test.mjs"
+    "test": "node --test test/key-rotate.test.mjs test/route-pool.test.mjs test/runtime.test.mjs test/panel-api.test.mjs test/client-module.test.mjs test/quota.test.mjs"
   },
   "dsh": {
     "bundle": {

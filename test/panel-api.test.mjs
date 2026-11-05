@@ -81,12 +81,13 @@ const providerService = {
     : [{ id: 'model-2', name: 'Model 2' }]),
 }
 
-test('registers the three loopback routes', () => {
+test('registers the loopback routes', () => {
   const ctx = createCtx({ webServer: undefined, llm: providerService })
   apply(ctx, {})
   assert.deepEqual([...ctx.routes.keys()].sort(), [
     '/api/keypool/catalog',
     '/api/keypool/config',
+    '/api/keypool/quota',
     '/api/keypool/status',
   ])
 })

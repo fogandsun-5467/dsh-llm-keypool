@@ -6,6 +6,23 @@
 > 背景：DSH 内核一个 provider 路由只能配一个 `apiKeyEnv`，`dsh-llm-retry` 只在同一条路由同一把 key 上重试，
 > 额度类错误默认直接失败；社区市场也没有现成的多 key / 路由池插件。这个 bundle 补上这一块。
 
+## 本仓库说明（fork）
+
+这是 [NethielChou/dsh-llm-keypool](https://github.com/NethielChou/dsh-llm-keypool) 的 fork
+（上游 MIT 协议，版权归原作者），在上游 0.1.3 的基础上加了两处改动：
+
+1. **额度读取**（`lib/quota.js`）：面板里直接显示每个供应商 5 小时窗口和周窗口的剩余额度与倒计时，
+   额度读到 0 的供应商会被提前跳过。切换规则：5 小时额度用尽 → 停用到本窗口结束；
+   周额度用尽 → 本周不再使用，等下周自动恢复。
+2. **优先用第一个套餐**（`preferFirst`，默认关闭，不影响原有行为）：勾选后池子顺序就是偏好顺序——
+   总是先用第一条（额度小的先用完），第一条额度用尽才换下一条，额度窗口刷新后自动切回第一条。
+
+从本仓库安装：
+
+```sh
+dsh plugin --profile web add github:fogandsun-5467/dsh-llm-keypool
+```
+
 ## 功能
 
 | 部分 | row id | 作用 |
@@ -15,12 +32,15 @@
 | **轮换池面板**（图形界面） | `llm-keypool` | 从 DSH 里**已经配好**的供应商和模型里勾选、排序，存成轮换池；显示当前路由、冷却中的供应商、最近切换记录 |
 | **路由池 fallback** | `llm-keypool` | 当前路由额度用尽 → 冷却它 → 同一步自动改用池里的下一条（可跨供应商、跨模型） |
 | **凭据轮换**（可选，默认关闭） | `llm-keypool` | 同一个供应商有多把 key 时，额度用尽自动把下一把 key 写进当前凭据引用 |
+| **额度读取**（可选，默认开启） | `llm-keypool` | 面板显示每个供应商 5 小时 / 周窗口的剩余额度与倒计时；额度用尽的供应商提前跳过，窗口刷新后自动恢复 |
 
 > 一个包只挂**一行**（`llm-keypool`）：DSH 的浏览器模块系统按包名识别 bundle，一个包挂多个 Loader 入口会
 > 触发 `duplicate factory registration`。面板和两个兜底行为都由这一行加载。
 
 - 面板入口：侧边栏「**轮换池**」一行（与「用量/余额」同款样式；侧栏收起时是圆形图标）。
 - 池子按**顺序兜底**：第一条优先，额度用完换第二条，依此类推；当前健康时绝不折腾。
+- 勾选「**优先用第一个套餐**」后改成**池序即偏好**：有额度就一直用第一条（额度小的先用完），
+  第一条额度用尽才换下一条；第一条的额度窗口刷新后会自动切回来；周额度用尽的套餐在周窗口刷新前不再参与。
 - 保存即生效（写入 `$DSH_HOME/keypool/route-pool.json`，下一次请求读取），**不需要重启**。
 - 只处理额度类失败；不写 session 事件、不改历史、不碰凭据值日志。
 
@@ -31,6 +51,10 @@
 ### 从 GitHub 安装（推荐）
 
 ```sh
+# 本仓库（fork，含额度读取 + 优先用第一个套餐）
+dsh plugin --profile web add github:fogandsun-5467/dsh-llm-keypool
+
+# 上游原版
 dsh plugin --profile web add github:NethielChou/dsh-llm-keypool
 ```
 
@@ -45,7 +69,7 @@ dsh plugin --profile web add @nethiel/dsh-llm-keypool
 ### 本地开发 / 手动挂载
 
 ```sh
-git clone https://github.com/NethielChou/dsh-llm-keypool.git
+git clone https://github.com/fogandsun-5467/dsh-llm-keypool.git
 dsh plugin --profile web add link:$(pwd)/dsh-llm-keypool
 ```
 
@@ -82,13 +106,17 @@ dsh plugin --profile web add link:$(pwd)/dsh-llm-keypool
   ],
   "cooldownMs": 600000,
   "maxSwitchesPerTurn": 3,
-  "codes": ["QUOTA", "ACCOUNT_QUOTA"]
+  "codes": ["QUOTA", "ACCOUNT_QUOTA"],
+  "preferFirst": false
 }
 ```
 
 - `codes` 是**触发切换的失败类型**：默认 `QUOTA / ACCOUNT_QUOTA / RATE_LIMIT`（额度类 + 429 限流）。面板里的
   「认证失败（401/403）也切换」勾选项就是往这里加 `AUTH`；也可以在文件里直接写成
   `["QUOTA", "ACCOUNT_QUOTA", "AUTH"]`。
+- `preferFirst` 决定池子怎么用，默认 `false`（**顺序兜底**：第一条额度用尽才换第二条，当前健康就绝不折腾）。
+  改成 `true` 就是**池序即偏好**：每次都先用第一条（额度小的先用完），第一条额度用尽才换下一条，
+  额度窗口刷新后自动切回第一条；周额度用尽的套餐在周窗口刷新前不再参与。
 - **限流（429 / RATE_LIMIT）默认就会切换**，但只把该供应商冷却 **60 秒**（额度类失败才用完整的冷却分钟数），避免一次瞬时限流把好线路冻结 10 分钟。
 - 除了 `codes`，默认还会按中英文报错文案（余额不足/额度用尽/quota exceeded 等）判断；文案特殊时在行配置里加 `patterns`。
 
@@ -108,6 +136,7 @@ dsh plugin --profile web add link:$(pwd)/dsh-llm-keypool
               model: model-2
       cooldownMs: 600000
       maxSwitchesPerTurn: 3
+      # preferFirst: true                     # 可选：true = 按池序首选（先用额度小的，用完自动换大的）
       # codes: [QUOTA, ACCOUNT_QUOTA, AUTH]   # 可选：额外把哪些失败当作额度类错误
       # patterns: ['额度\s*(?:不足|用尽)']      # 可选：自定义报错文案正则（默认已含中英文常见措辞）
     keyRotate:
@@ -152,13 +181,13 @@ dsh plugin --profile web add link:$(pwd)/dsh-llm-keypool
 
 ## 验证
 
-- 单元测试：`node --test test/*.mjs`，**46/46 通过**（配置解析/预算/中文文案/prepend 顺序/冷却恢复/
-  面板三个回环端点/浏览器半区加载/闲时无副作用）。
+- 单元测试：`node --test test/*.mjs`，**73/73 通过**（配置解析/预算/中文文案/prepend 顺序/冷却恢复/
+  面板回环端点/浏览器半区加载/闲时无副作用/额度窗口解析/优先用第一个套餐）。
 - 端到端（真实 DSH headless + 本地 mock OpenAI 网关）：
   - 跨供应商跨模型兜底：`A/flash` 402 → 自动切 `B/chat`，`pong`、exit 0；
   - 全池耗尽：每条路由只试一次后正常失败，不死循环；BOM 配置、非法配置、只读降级均有覆盖。
 - 真实网关验证（LiteLLM 兼容网关）：无效 key 返回 `401 AUTH` → 自动切换有效的 key → 同一步成功返回。
-- 面板后端：`/api/keypool/catalog|config|status` 单元测试覆盖 200/400/403/405 与写入后即时生效。
+- 面板后端：`/api/keypool/catalog|config|status|quota` 单元测试覆盖 200/400/403/405 与写入后即时生效。
 
 ## 已知限制
 
@@ -172,10 +201,11 @@ dsh plugin --profile web add link:$(pwd)/dsh-llm-keypool
 ## 文件
 
 ```
-index.js               bundle 根 + 面板 Host 半区（/api/keypool/* 三个回环端点）
+index.js               bundle 根 + 面板 Host 半区（/api/keypool/* 四个回环端点：catalog/config/status/quota）
 lib/client.js          浏览器半区（侧边栏入口 + 轮换池面板）
 lib/route-pool.js      路由池兜底
 lib/key-rotate.js      凭据轮换
+lib/quota.js           额度读取（5 小时窗口 / 周窗口的剩余额度与重置时间）
 lib/runtime.js         配置文件读写 + 当前路由/冷却/切换记录
 lib/shared.js          配额判断 / 预算 / 池子规范化
 cordis.patch.yml       bundle patch（面板+route-pool 启用、key-rotate disabled）

@@ -290,3 +290,109 @@ test('RATE_LIMIT is a default trigger with a short transient cooldown', async ()
   const next = await request(dispatch, 'route-a')
   assert.equal(next.provider, 'route-b')
 })
+
+test('a quota failure cools the provider until the quota window resets', async () => {
+  const { dispatch } = setup({
+    quota: { exhausted: () => false, cooldownMs: () => 5 * 60 * 60_000 },
+  })
+  assert.deepEqual(await fail(dispatch, 'route-a'), { kind: 'retry' })
+  const cooling = statusSnapshot().cooling.find((entry) => entry.provider === 'route-a')
+  assert.ok(cooling, 'route-a should be cooling')
+  assert.ok(cooling.remainingMs > 4 * 60 * 60_000, `expected ~5h of cooldown, got ${cooling.remainingMs}`)
+})
+
+test('a quota hook never shortens the cooldown of a quota failure', async () => {
+  const { dispatch } = setup({
+    cooldownMs: 600000,
+    quota: { exhausted: () => false, cooldownMs: () => 60_000 },
+  })
+  assert.deepEqual(await fail(dispatch, 'route-a'), { kind: 'retry' })
+  const cooling = statusSnapshot().cooling.find((entry) => entry.provider === 'route-a')
+  assert.ok(cooling, 'route-a should be cooling')
+  assert.ok(cooling.remainingMs > 9 * 60_000, `expected the full 10min cooldown, got ${cooling.remainingMs}`)
+})
+
+test('RATE_LIMIT keeps its short transient cooldown even with a quota hook', async () => {
+  const { dispatch } = setup({
+    quota: { exhausted: () => false, cooldownMs: () => 5 * 60 * 60_000 },
+  })
+  assert.deepEqual(await fail(dispatch, 'route-a', { code: 'RATE_LIMIT', message: 'rate limited' }), { kind: 'retry' })
+  const cooling = statusSnapshot().cooling.find((entry) => entry.provider === 'route-a')
+  assert.ok(cooling, 'route-a should be cooling')
+  assert.ok(cooling.remainingMs <= 61_000, `expected <= 61s, got ${cooling.remainingMs}`)
+})
+
+// ---- preferFirst: the pool order is the preference order -------------------
+
+test('without preferFirst the healthy current route stays selected', async () => {
+  const { dispatch } = setup()
+  assert.equal((await request(dispatch, 'route-b')).provider, 'route-b')
+})
+
+test('preferFirst routes to the first healthy pool route even when the current one is healthy', async () => {
+  const { dispatch } = setup({ preferFirst: true })
+  const result = await request(dispatch, 'route-b')
+  assert.equal(result.provider, 'route-a')
+  assert.equal(result.model, 'deepseek-flash')
+  assert.equal(result.reasoningEffort, 'high')
+  assert.equal(result.maxTokens, 4096)
+})
+
+test('preferFirst skips a first route whose quota is exhausted', async () => {
+  const { dispatch } = setup({
+    preferFirst: true,
+    quota: { exhausted: (provider) => provider === 'route-a', cooldownMs: () => 60_000 },
+  })
+  assert.equal((await request(dispatch, 'route-c')).provider, 'route-b')
+})
+
+test('preferFirst falls through to the next healthy route when the first one is cooling', async () => {
+  const { dispatch } = setup({ preferFirst: true })
+  await fail(dispatch, 'route-a')
+  assert.equal((await request(dispatch, 'route-c')).provider, 'route-b')
+})
+
+test('preferFirst never moves a request onto another model', async () => {
+  const { ctx, dispatch } = createFakeCtx()
+  apply(ctx, {
+    pools: [{
+      routes: [
+        { provider: 'route-a', model: 'deepseek-flash' },
+        { provider: 'route-b', model: 'other-model' },
+      ],
+    }],
+    preferFirst: true,
+  })
+  const ask = (provider, model) =>
+    dispatch('agent/request', requestPayload(), async () => ({ provider, model }))
+  // route-b serves another model: the pool order must not pull the request to it.
+  assert.deepEqual(await ask('route-b', 'other-model'), { provider: 'route-b', model: 'other-model' })
+})
+
+test('preferFirst can come from the GUI-managed config file', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-keypool-prefer-'))
+  const previous = process.env.DSH_KEYPOOL_CONFIG
+  process.env.DSH_KEYPOOL_CONFIG = join(dir, 'route-pool.json')
+  try {
+    writeFileSync(process.env.DSH_KEYPOOL_CONFIG, JSON.stringify({
+      pools: [{
+        name: 'gui',
+        routes: [
+          { provider: 'route-a', model: 'deepseek-flash' },
+          { provider: 'route-b', model: 'deepseek-flash' },
+        ],
+      }],
+      cooldownMs: 600000,
+      maxSwitchesPerTurn: 3,
+      preferFirst: true,
+    }), 'utf8')
+    const { ctx, dispatch } = createFakeCtx()
+    // The row itself carries no pools and no flag: only the GUI file has them.
+    apply(ctx, { pools: [] })
+    const ask = (provider) =>
+      dispatch('agent/request', requestPayload(), async () => resolved(provider))
+    assert.equal((await ask('route-b')).provider, 'route-a')
+  } finally {
+    process.env.DSH_KEYPOOL_CONFIG = previous
+  }
+})
