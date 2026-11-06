@@ -227,6 +227,57 @@ agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
 11. `preferFirst`：池序即偏好；额度用尽的第一条被跳过；只同模型换路由。
 12. GUI 配置文件（`$DSH_HOME/keypool/route-pool.json`）里的池子/开关/触发码优先于 row 配置。
 
+## 3.1 额度窗口与回切规则（cn → max → 回切 cn）
+
+以用户的实际场景命名（池内两条路由：`minimax-cn` 与 `minimax-max`，同一个模型
+`MiniMax-M3.1-Flash`，`preferFirst` 打开）。规则对任意池成立。
+
+### 术语
+
+| 词 | 含义 | 谁判定 | 何时回池 |
+|---|---|---|---|
+| **冷却 (cooling)** | 临时停用一条路由 | 插件自己的 `coolingUntil` 表 | 冷却到期自动回池 |
+| **耗尽 (exhausted)** | 额度读取器确认某个窗口剩余为 0 | `lib/quota.js` 的 `summarizeEntry()` | **只有该窗口重置才回池** |
+
+### 规则
+
+1. **池序即偏好**：`preferFirst` 打开时，每次选路先取池里第一条「同模型且健康」的路由。
+   cn 排第一 ⇒ 正常情况走 cn。
+2. **cn 的 5 小时窗口用尽** ⇒ cn 被判为耗尽 ⇒ 跳过 cn ⇒ 走 max。
+   冷却时长取「各窗口重置时间的**较晚者**」（`lib/quota.js` 的 `resetAt`）：只有 5 小时窗口用尽时，
+   就是 5 小时窗口的重置时间；周窗口也用尽时，就是周窗口的重置时间。
+3. **5 小时窗口恢复** ⇒ 读取器读到 cn 剩余 > 0 ⇒ 耗尽判定消失 ⇒ cn 重新健康 ⇒
+   **下一次选路优先切回 cn**。
+4. **cn 的周窗口也用尽** ⇒ 耗尽判定继续成立（**任一窗口为 0 即耗尽**）⇒
+   即使 5 小时窗口恢复也**不再切回 cn**，直到周窗口重置。
+5. **判定只看额度读取器，不看插件的冷却表**：读取器每 60 秒预读一次（TTL 5 分钟）；
+   插件进程重启后冷却表清空，但读取器的判定仍在 ⇒ 重启前后行为一致。
+6. **读不到就不阻断**：`exhausted()` 只承认「确认读到」的结果。读不到（凭据缺失 / 网络不通）
+   按「未耗尽」处理，回落到固定冷却 `cooldownMs`（默认 10 分钟）。
+   **此时第 3、4 条不成立**——「5 小时才回 cn」依赖能读到额度数据。
+7. **切换落在下一步/下一轮**：0.2.2 步内路由冻结，额度用尽后切到 max 是「下一步」的事。
+   由于读取器提前预读，正常情况下请求还没发出就已换走，用户看不到报错；
+   只有额度刚用尽、读取器还没刷新（≤ TTL）时，第一个请求会失败并把错误冒泡，
+   从下一轮起走 max。
+8. **同模型约束**：`preferFirst` 只在同模型之间回切（`preferredRoute` 要求
+   `candidate.model === resolved.model`）。cn 与 max 的 model id 必须一致，否则不回切。
+
+### 实现落点
+
+| 规则 | 代码 |
+|---|---|
+| 1 / 3 / 4 / 8 | `lib/route-pool.js` 的 `planRoute()` / `preferredRoute()` / `nextHealthyRoute()` |
+| 2 | `lib/quota.js` 的 `summarizeEntry()`（`exhausted` / `resetAt`）→ `lib/route-pool.js` 的 `quotaCooldown()` |
+| 5 / 6 | `lib/quota.js` 的 `read()` / `cached()` / `exhausted()`；预读循环在 `index.js` 的 quota refresher |
+| 7 | `lib/route-pool.js` 的三个钩子（`agent/inbox/inserted` / `agent/pre-step` / `agent/request-error`） |
+
+### 怎么确认这套规则真的生效
+
+- 面板额度页（`GET /api/keypool/quota`）能看到 cn / max 的 5 小时与周窗口读数 ⇒ 读取器通了，
+  第 2–4 条成立；
+- 额度页读不到（`ok: false`）⇒ 只能靠失败后的固定冷却，第 3、4 条不成立；
+- 切路由时对话里会出现内核自动插入的 `[model changed: …]`。
+
 ## 4. 交付标准
 
 - 两个测试文件全绿（`node --test`）。
