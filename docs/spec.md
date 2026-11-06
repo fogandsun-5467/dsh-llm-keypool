@@ -8,7 +8,7 @@
 共用 `https://api.llm.ustc.edu.cn/`、同一批模型 id，但 `apiKeyEnv` 各自不同。
 希望一把 key 额度用尽后自动换下一把，不手动改配置。
 
-已从 `app.asar`（DSH 2.0.19-next / 内核 0.2.1-rc.2）核实的契约：
+已从安装的内核（DSH 0.2.2-rc.1，`@deepseek-ai/dsh-agent` / `dsh-agent-loop`）核实的契约：
 
 1. **`agent/request-error` waterfall**：payload 是
    `{ agent, turn, step, provider, failure, retryPolicy, signal }`。
@@ -17,14 +17,31 @@
    （DSH 用英文正则识别，中文报错常常落到 `PI_AI_ERROR`，所以插件必须自己看 `message`）。
    监听器若返回 `{ kind: 'retry' }`，agent loop 会在**同一轮、同一步**重跑失败步骤；
    若返回 `undefined`（或不返回），由下游/终态处理，轮次以该失败结束。
-   **重试会重新走 `agent/request` waterfall，也会重新解析凭据**——这是两个插件能工作的根基。
+   **重试会重新解析凭据**（同一路由），所以换 key 仍然靠 `{kind:'retry'}` 生效；
+   但**重试不会换路由**——0.2.2 的路由在步内是冻结的。
 
-2. **`agent/request` waterfall**：payload 只有 `{ turn, step, signal }`；
-   `next()` 返回当次请求的配置 `{ provider, model, reasoningEffort?, maxTokens? }`。
-   监听器可以返回改写后的配置。内核自己的 `installModelSelection`
-   （`dsh-agent/lib/index.js`）就是用 `ctx.on('agent/request', ...)` 在 `next()` 之后
-   覆盖 provider/model；它注册在 agent 作用域上。**全局插件要在它之后生效，
-   必须用 `{ prepend: true }` 注册**（prepend 排在链首，先 `await next()` 再覆盖）。
+2. **0.2.2 起路由在步内冻结**：agent 在「提示词组装 + pre-step」之前就固定了本步的
+   provider/model/reasoning effort（`dsh-agent-loop/lib/index.js` 的 `preStep()`：
+   `const selection = this.model.current()` 先取，随后才 assemble + dispatch `agent/pre-step`）。
+   - `agent/request` **不再允许改路由**：payload 只有 `{ agent, turn, step, signal }`，
+     改写 provider/model 会让内核直接抛错
+     （`agent/request proposed "x/y" after step preparation fixed "a/b"; use agent.model.select() before step preparation`）。
+     官方文档也写明「`agent/request` 已废弃，不要再新增监听器」。
+   - 换路由的唯一入口是 **`agent.model.select({ provider, model, reasoningEffort? })`**：
+     它给「**尚未开始准备的下一步**」定下完整选择；`agent.model.current()` 读回当前选择
+     （pending → 最近一次请求 → agent.options）。
+   - **三个可用的时机**：
+     | 时机 | 事件 | 选中的路由对哪一步生效 |
+     |---|---|---|
+     | 消息落进收件箱、驱动还没醒 | `agent/inbox/inserted`（payload `{ agent, message }`） | 本轮**第一步** |
+     | 本步路由已固定 | `agent/pre-step`（payload 含 `modelSelection`） | **下一步** |
+     | 本步请求失败 | `agent/request-error` | **下一步** |
+   - `agent/inbox/inserted` 在 `ReactLoopInbox.mutate()` 里于 `session.append('agent/inbox/spliced')`
+     之后同步 emit，早于 `wakeDriver()`；此时 `agent.model.select()` 安全（不会撞上
+     "session append cannot reenter while another append is being published"）。
+   - **不要**在 `session/event` 观察者里调 `agent.model.select()`：那次 append 还没结束，会被吞掉。
+   - 内核的 `installModelSelection`（`dsh-agent/lib/index.js`）会在 `agent/pre-step` 里比较
+     本步路由与上一次请求的路由，不一致时自动插一条 `modelSwitchNotice`——切路由会被自动播报。
 
 3. **凭据热切换**：`dsh-llm-pi-ai` 的 `resolveApiKey()` 每次请求都调
    `credentials.resolve(ref)`（`lib/index.js:2886`），且 `credentials` 文档明确
@@ -151,50 +168,64 @@ dryRun: false                      # 可选：true 时只打日志、不记录�
 
 ### 运行时行为
 
-状态：`Map<provider, cooldownUntilMs>`（模块/闭包级，apply 每次重新初始化）。
+状态：`Map<provider, cooldownUntilMs>`（闭包级，apply 每次重新初始化）+ `routesByAgent`（WeakMap，
+agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
 `SwitchBudget` 用于按 agent+turn 限制切换次数。
 
-1. **监听 `agent/request`，必须 `{ prepend: true }`**：
+**三个钩子，都用 `agent.model.select()` 选路，绝不改写 `agent/request`：**
+
+1. **`agent/inbox/inserted`**（payload `{ agent, message }`）——选本轮第一步的路由：
    ```
-   const resolved = await next()
-   const pool = poolFor(resolved)                      // 按 model 匹配，见下
-   if (!pool) return resolved
-   const currentIndex = pool.routes.findIndex(r => r.provider === resolved.provider)
-   if (currentIndex < 0) return resolved               // 当前 provider 不在池里：不动
-   if (!isCooling(resolved.provider)) return resolved  // 当前健康：保持当前路由
-   const target = 从 currentIndex 之后按池顺序环形找第一个 !isCooling(route.provider) 的路由
-   if (!target) return resolved                        // 全都在冷却：交给正常请求/失败
-   logger.info(...)                                    // provider A -> B（不含敏感数据）
-   return { ...resolved, provider: target.provider, ...(target.model ? { model: target.model } : {}) }
+   const current = currentRoute(agent)          // agent.model.current() → {provider, model}
+   const plan = planRoute(current)               // 见下：{pool, current, target, reason}
+   if (!plan || plan.reason === 'healthy') return
+   selectRoute(agent, plan.current, plan.target) // agent.model.select({provider, model})
    ```
-   - `poolFor(resolved)`：返回第一个 `pool.model === resolved.model` 的池。
-   - 环形查找要能跨过当前位置；同一 poll 内不重复访问。
-   - **不要**只在"当前 provider 冷却"时才换：当前健康就绝不折腾。
-2. **监听 `agent/request-error`**（非 prepend）：
-   - `failure` 不匹配（`matchesFailure`）→ `next()`。
-   - `payload.provider` 不在任何池中 → `next()`。
-   - 预算 `take()` 失败 → `next()`。
-   - 计算"是否存在至少一个其他健康路由"（排除当前 provider）：
-     - 没有 → `next()`（不标记冷却也无意义；可 warn 一次）。
-     - 有 → 标记当前 provider 冷却到 `Date.now() + cooldownMs`（`dryRun` 时跳过），
-       `logger.warn`，`return { kind: 'retry' }`。
-3. 冷却判定 `isCooling(provider)`：`now < until`；过期即视为健康（惰性清除，不做定时器）。
-4. 所有日志不得包含 key / 凭据值；provider/model 名可以出现。
+2. **`agent/pre-step`**（payload 含 `modelSelection`）——本步路由已固定：
+   - 先 `await next()`，**原样返回 decision**（不改消息、不拒绝步骤）；
+   - 用 `modelSelection` 记住本步路由（`routesByAgent.set(agent, {route, pool})`；
+     不在池里就 `routesByAgent.delete(agent)`）；
+   - 再按 `planRoute` 为**下一步**选路。
+3. **`agent/request-error`**（非 prepend）——本步失败：
+   - `failure` 不匹配（`matchesFailure`）→ `next()`；
+   - 归因失败路由：先看 `routesByAgent.get(agent)`（provider 必须一致），
+     否则回退到「provider 在池中唯一」的匹配；都不中 → `next()`；
+   - 预算 `budget.take(agent, turn, maxSwitchesPerTurn)` 失败 → `next()`；
+   - 标记当前 provider 冷却（`RATE_LIMIT` 用短冷却，其余用额度窗口，`dryRun` 时跳过），
+     `logger.warn`；
+   - 为**下一步**选好下一条健康路由（`selectRoute`）；
+   - **`return next()`**——不返回 `{kind:'retry'}`：步内路由被冻结，重试只会再撞同一条死路由；
+     让失败照常冒泡，同时把下一步的路由准备好。
+     （凭据轮换插件仍然返回 `{kind:'retry'}`：换 key 不换路由，重试是有效的。）
+
+`planRoute(current)` 的规则：
+- `current` 不在任何池里（provider **和** model 都要命中）→ 不动；
+- `preferFirst` 打开 → 池序即偏好：取第一条健康的、同模型的路由；
+- 否则只在当前路由冷却或额度用尽时，按池序环形找下一条健康的路由（跳过冷却/额度用尽/同一 provider）；
+- 都没有 → `reason: 'healthy'`，不动。
+
+`selectRoute(agent, current, target)`：`agent.model.select({ provider, model })`；
+**只有 model 没变**时才把 `reasoningEffort` 一起带上（与内核 `applyConfiguredRoute` 的规则一致）。
+
+4. 冷却判定 `isCooling(provider)`：`now < until`；过期即视为健康（惰性清除，不做定时器）。
+5. 所有日志不得包含 key / 凭据值；provider/model 名可以出现。
+6. 任何钩子都不许抛异常回 waterfall：出错 → warn + 继续。
 
 ### 测试要求（`test/route-pool.test.mjs`，至少覆盖）
 
-1. 当前 provider 健康 → `agent/request` 原样返回（provider 不变）。
-2. QUOTA 失败 → 标记冷却、返回 `{kind:'retry'}`；随后 `agent/request` 把 provider 换成池中下一个。
-3. 连续失败两把 key → 第三次请求换到第三条路由；三把都冷却后 `agent/request` 原样返回。
-4. `route.model` 覆盖生效（切换后 `model` 字段被替换；未配置时保持不变）。
-5. 其他字段（`reasoningEffort`、`maxTokens`）在改写时保留。
-6. 非配额失败不触发、不冷却。
-7. 冷却到期（`cooldownMs: 20` + 等待 ~30ms）后原 provider 重新可用（`agent/request` 保持原 provider）。
-8. `maxSwitchesPerTurn` 限制：预算用完后不再 `{kind:'retry'}`。
-9. 不在池中的 provider 不受影响。
-10. `{ prepend: true }` 生效：注册一个"后注册但模拟 model-selection 行为"的
-    `agent/request` 监听器（在 `next()` 后覆盖 provider），验证最终返回值是插件改写后的 provider。
-    （即：先 `apply`，再注册另一个非 prepend 的监听器，dispatch 时插件应仍能覆盖它。）
+1. 插件**不改写** `agent/request`：失败之后请求配置原样返回。
+2. `agent/inbox/inserted` → `agent.model.select()` 被调用，选的是下一条健康路由（额度用尽时）。
+3. `agent/pre-step` → decision 原样返回，且为**下一步**选好路由。
+4. `agent/request-error` → provider 被冷却、状态面板记录切换与失败、且**返回下游的终态**
+   （不是 `{kind:'retry'}`）。
+5. 连续失败两把路由 → 依次选到第二、第三条；三把都冷却后不再选（交给失败）。
+6. `route.model` 覆盖生效（选中的 `model` 被替换；未配置时保持不变）。
+7. 非配额失败不触发、不冷却。
+8. 冷却到期（`cooldownMs: 20` + 等待 ~30ms）后原 provider 重新可用。
+9. `maxSwitchesPerTurn` 限制：预算用完后不再切换。
+10. 不在池中的 provider 不受影响（既不选路也不冷却）。
+11. `preferFirst`：池序即偏好；额度用尽的第一条被跳过；只同模型换路由。
+12. GUI 配置文件（`$DSH_HOME/keypool/route-pool.json`）里的池子/开关/触发码优先于 row 配置。
 
 ## 4. 交付标准
 

@@ -30,7 +30,7 @@ dsh plugin --profile web add github:fogandsun-5467/dsh-llm-keypool
 | 能力 | 行 id | 说明 |
 |---|---|---|
 | **轮换池面板**（图形界面） | `llm-keypool` | 从 DSH 里**已经配好**的供应商和模型里勾选、排序，存成轮换池；显示当前路由、冷却中的供应商、最近切换记录 |
-| **路由池 fallback** | `llm-keypool` | 当前路由额度用尽 → 冷却它 → 同一步自动改用池里的下一条（可跨供应商、跨模型） |
+| **路由池 fallback** | `llm-keypool` | 当前路由额度用尽 → 冷却它 → **下一步**自动改用池里的下一条（可跨供应商、跨模型） |
 | **凭据轮换**（可选，默认关闭） | `llm-keypool` | 同一个供应商有多把 key 时，额度用尽自动把下一把 key 写进当前凭据引用 |
 | **额度读取**（可选，默认开启） | `llm-keypool` | 面板显示每个供应商 5 小时 / 周窗口的剩余额度与倒计时；额度用尽的供应商提前跳过，窗口刷新后自动恢复 |
 
@@ -46,7 +46,11 @@ dsh plugin --profile web add github:fogandsun-5467/dsh-llm-keypool
 
 ## 安装
 
-要求：DSH 内核 `>= 0.2.1-rc.2`。
+要求：DSH 内核 `>= 0.2.2-rc.1`。
+
+> **内核版本是硬要求。** DSH 0.2.2 起，agent 在「提示词组装 + pre-step」之前就固定了本步的
+> provider/model/reasoning effort，`agent/request` 不再允许改路由（改了内核会直接抛错）。
+> 路由池因此改为通过 `agent.model.select()` 选路，只在 0.2.2-rc.1 及以后的内核上工作。
 
 ### 从 GitHub 安装（推荐）
 
@@ -86,8 +90,9 @@ dsh plugin --profile web add link:$(pwd)/dsh-llm-keypool
 5. 「保存」；
 6. 在面板「状态」里查看当前路由 / 冷却中的供应商 / 最近切换记录。
 
-额度用尽时的行为：当前路由冷却（默认 10 分钟）+ 同一轮自动切到下一条健康的 `供应商/模型` 重试；
-全部冷却则这一步正常失败，不会死循环。
+额度用尽时的行为：当前路由冷却（默认 10 分钟）+ **下一步**自动切到下一条健康的 `供应商/模型`；
+全部冷却则这一步正常失败（不会死循环）。0.2.2 起内核在步内冻结路由，所以同一步内不会换供应商——
+额度用尽的那一步会失败，兜底从下一步生效。
 
 ## 配置参考
 
@@ -169,24 +174,40 @@ dsh plugin --profile web add link:$(pwd)/dsh-llm-keypool
 
 1. **凭据热切换**：`dsh-llm-pi-ai` 的 `resolveApiKey()` 每次请求都重新解析凭据引用，凭据服务文档也明确
    「轮换后的已存储密钥作用于下一次请求」——所以换 key 只需要改一个凭据值。
-2. **同一步重试**：监听 `agent/request-error` 返回 `{ kind: 'retry' }`，agent loop 会在同一轮同一步重跑失败步骤；
-   重试会重新走 `agent/request` waterfall 并重新解析凭据/路由。
-3. **路由改写**：`agent/request` 监听器用 `{ prepend: true }` 注册——DSH 自己的会话模型选择也在该 waterfall 上，
-   并且在 `next()` 之后覆盖 provider/model；不 prepend 就会被改回去。
-4. **失败归因**：`agent/request-error` 只带 provider 不带 model，因此用「最近一次命中的池路由」归因，
-   回退到「provider 在池中唯一」的匹配；只有 `provider + model` 同时命中池子才改写。
+2. **选路时机**：0.2.2 的 agent 会在 `pre-step` 之前固定本步路由，所以路由池在三个时机说话：
+   - `agent/inbox/inserted`：消息落进收件箱、驱动还没醒——这时选中的路由就是**本轮第一步**的路由；
+   - `agent/pre-step`：本步路由已经定下——这时选中的路由是**下一步**的路由；
+   - `agent/request-error`：本步请求失败——冷却掉出问题的供应商，并为**下一步**选好下一条健康路由。
+3. **不碰 `agent/request`**：内核会拒绝与本步固定路由不一致的配置（`agent/request proposed ... after
+   step preparation fixed ...`），所以插件不再改写请求配置，改用 `agent.model.select()` 选路。
+4. **失败不吞掉**：同一步内重试只会再撞同一条死路由（路由已被冻结），所以路由池**不**返回
+   `{ kind: 'retry' }`，而是让失败照常冒泡，由内核把这次请求判失败，同时把下一条健康路由准备好。
+   凭据轮换（换 key）不受影响：它换的是同一个供应商的 key，重试仍然有效。
+5. **失败归因**：`agent/request-error` 只带 provider 不带 model，因此用「本步固定的池路由」归因，
+   回退到「provider 在池中唯一」的匹配；只有 `provider + model` 同时命中池子才切路由。
+6. **reasoning effort**：只在模型不变时随路由带走；换模型时不带 effort（与内核 `applyConfiguredRoute`
+   的规则一致），避免把一个模型不认识的 effort id 传过去。
 
 插件只写 `ctx.logger`，不 append 任何 session 事件（自造事件类型会让 Session 无法重新打开），
 也不向 waterfall 抛异常。
 
 ## 验证
 
-- 单元测试：`node --test test/*.mjs`，**73/73 通过**（配置解析/预算/中文文案/prepend 顺序/冷却恢复/
-  面板回环端点/浏览器半区加载/闲时无副作用/额度窗口解析/优先用第一个套餐）。
-- 端到端（真实 DSH headless + 本地 mock OpenAI 网关）：
+- 单元测试：`node --test`，**77/77 通过**（配置解析/预算/中文文案/冷却恢复/优先用第一个套餐/
+  面板回环端点/浏览器半区加载/闲时无副作用/额度窗口解析），其中路由池的用例全部按 0.2.2 的新契约写：
+  「不改写 `agent/request`」「收件箱插入时选路」「pre-step 时为下一步选路」「失败后冷却并为下一步选路」
+  「失败不吞掉（不返回 `{kind:'retry'}`）」「池外供应商不动」「状态面板」。
+- 端到端（真实 DSH headless + 本地 mock OpenAI 网关，0.2.1-rc.4 内核上的历史结论）：
   - 跨供应商跨模型兜底：`A/flash` 402 → 自动切 `B/chat`，`pong`、exit 0；
   - 全池耗尽：每条路由只试一次后正常失败，不死循环；BOM 配置、非法配置、只读降级均有覆盖。
-- 真实网关验证（LiteLLM 兼容网关）：无效 key 返回 `401 AUTH` → 自动切换有效的 key → 同一步成功返回。
+  - 0.2.2-rc.1 起路由在步内冻结，同一步内不再切供应商，兜底落在**下一步**。
+- 端到端（真实 DSH **0.2.2-rc.1**，独立临时 `DSH_HOME` + 本地 mock OpenAI 兼容服务，不碰正式配置）：
+  - 插件在 0.2.2-rc.1 上正常加载，面板端点 `/api/keypool/status|config|catalog` 全部 200；
+  - 真实 agent 回合里钩子确实触发：`pre-step` 记下本步路由（面板 `active`）；额度失败后
+    `agent/request-error` 冷却该供应商并调用 `agent.model.select()`——会话投影里
+    `modelSelection.pending` 是池中的下一条路由、`lastUsed` 是失败的那条，
+    即新契约生效、且没有触发内核的 `agent/request proposed … after step preparation fixed …` 报错。
+- 真实网关验证（LiteLLM 兼容网关）：无效 key 返回 `401 AUTH` → 自动切换有效的 key → 请求成功返回。
 - 面板后端：`/api/keypool/catalog|config|status|quota` 单元测试覆盖 200/400/403/405 与写入后即时生效。
 
 ## 已知限制
@@ -195,8 +216,11 @@ dsh plugin --profile web add link:$(pwd)/dsh-llm-keypool
 2. 同一账号下的多把 key 可能共享额度，轮换前请确认额度独立。
 3. 换 key / 换模型会让供应商侧前缀缓存失效，切换后的第一轮输入 token 重新计费（成本略增）。
 4. 冷却状态在内存中，重启后清空（首个失败会重新标记，不影响正确性）。
-5. 只覆盖 agent loop 的模型请求（`agent/request-error`）；`ctx.llm.stream()` 直连调用不受影响。
+5. 只覆盖 agent loop 的模型请求（`agent/inbox/inserted`、`agent/pre-step`、`agent/request-error`）；
+   `ctx.llm.stream()` 直连调用不受影响。
 6. 面板依赖宿主 `sidebar.footer.action` 槽位与 `webServer` 回环端点（DSH Desktop / web profile 均满足）。
+7. 0.2.2 起路由在步内冻结：**同一步内**不会换供应商；额度用尽的那一步会失败，兜底从**下一步**生效
+   （想原地续跑可以重发消息）。
 
 ## 文件
 

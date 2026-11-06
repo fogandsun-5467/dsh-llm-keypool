@@ -1,6 +1,6 @@
 {
   "name": "@nethiel/dsh-llm-keypool",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "DSH rotation pool: a sidebar panel to pick configured provider/model routes and fail over across them on quota errors, plus optional multi-key rotation.",
   "keywords": [
@@ -26,7 +26,8 @@
     "url": "https://github.com/fogandsun-5467/dsh-llm-keypool/issues"
   },
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.12.0",
+    "dsh": ">=0.2.2-rc.1"
   },
   "peerDependencies": {
     "react": "^18.2.0",
@@ -67,9 +68,12 @@
     "client": {
       "platform": "web"
     },
+    "engines": {
+      "dsh": ">=0.2.2-rc.1"
+    },
     "compatibility": {
       "dshReleases": {
-        "0.2.1-rc.2": "compatible"
+        "0.2.2-rc.1": "compatible"
       }
     }
   }
