@@ -497,3 +497,21 @@ test('panel-written codes make AUTH a failover trigger, and only when present', 
     process.env.DSH_KEYPOOL_CONFIG = previous
   }
 })
+
+test('a rejecting downstream handler is called once and its error travels on', async () => {
+  const { dispatch, logs } = setup()
+  const agent = agentOn('route-a')
+  let calls = 0
+  // The key rotator sits downstream of the pool and may throw. The pool must
+  // not answer that with a second call: the error belongs to the host.
+  const terminal = async () => {
+    calls += 1
+    throw new Error('downstream exploded')
+  }
+  await assert.rejects(
+    dispatch('agent/request-error', requestErrorPayload({ provider: 'route-a', agent, failure: QUOTA }), terminal),
+    /downstream exploded/,
+  )
+  assert.equal(calls, 1)
+  assert.equal(logs.filter((entry) => String(entry.args[0]).includes('failover skipped')).length, 0)
+})

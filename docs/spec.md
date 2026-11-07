@@ -33,12 +33,15 @@
    - **三个可用的时机**：
      | 时机 | 事件 | 选中的路由对哪一步生效 |
      |---|---|---|
-     | 消息落进收件箱、驱动还没醒 | `agent/inbox/inserted`（payload `{ agent, message }`） | 本轮**第一步** |
+     | 消息落进收件箱、驱动还没醒 | `agent/inbox/inserted`（payload `{ agent, message }`） | **尚未开始准备的下一步**（通常就是本轮第一步） |
      | 本步路由已固定 | `agent/pre-step`（payload 含 `modelSelection`） | **下一步** |
      | 本步请求失败 | `agent/request-error` | **下一步** |
    - `agent/inbox/inserted` 在 `ReactLoopInbox.mutate()` 里于 `session.append('agent/inbox/spliced')`
      之后同步 emit，早于 `wakeDriver()`；此时 `agent.model.select()` 安全（不会撞上
      "session append cannot reenter while another append is being published"）。
+     注意内核也会把工具结果 / `additionalContexts` 以 "next-step" 拼进收件箱
+     （`dsh-agent-loop/lib/index.js:972`），所以这个事件在轮次中途也可能触发；
+     那时选中的路由落在**本轮的下一步**——与 `agent/pre-step` 同一套规则。
    - **不要**在 `session/event` 观察者里调 `agent.model.select()`：那次 append 还没结束，会被吞掉。
    - 内核的 `installModelSelection`（`dsh-agent/lib/index.js`）会在 `agent/pre-step` 里比较
      本步路由与上一次请求的路由，不一致时自动插一条 `modelSwitchNotice`——切路由会被自动播报。
@@ -182,7 +185,9 @@ agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
 
 **三个钩子，都用 `agent.model.select()` 选路，绝不改写 `agent/request`：**
 
-1. **`agent/inbox/inserted`**（payload `{ agent, message }`）——选本轮第一步的路由：
+1. **`agent/inbox/inserted`**（payload `{ agent, message }`）——为**尚未开始准备的下一步**选路：
+   消息落进收件箱时驱动还没醒，选中的路由就是本轮第一步；内核把工具结果拼进收件箱时
+   （轮次中途），选中的路由落在本轮的下一步。
    ```
    const current = currentRoute(agent)          // agent.model.current() → {provider, model}
    const plan = planRoute(current)               // 见下：{pool, current, target, reason}
@@ -199,11 +204,13 @@ agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
    - 归因失败路由：先看 `routesByAgent.get(agent)`（provider 必须一致），
      否则回退到「provider 在池中唯一」的匹配；都不中 → `next()`；
    - 预算 `budget.take(agent, turn, maxSwitchesPerTurn)` 失败 → `next()`；
-   - 标记当前 provider 冷却（`RATE_LIMIT` 用短冷却，其余用额度窗口，`dryRun` 时跳过），
+   - 标记当前 provider 冷却（`RATE_LIMIT` 用 60 秒短冷却；其余用「额度窗口剩余时间」与
+     「固定冷却 `cooldownMs`」中更长的那个，读不到额度就只按固定冷却；`dryRun` 时跳过），
      `logger.warn`；
    - 为**下一步**选好下一条健康路由（`selectRoute`）；
    - **`return next()`**——不返回 `{kind:'retry'}`：步内路由被冻结，重试只会再撞同一条死路由；
-     让失败照常冒泡，同时把下一步的路由准备好。
+     让失败照常冒泡，同时把下一步的路由准备好。下游（凭据轮换）拿到的就是这一次 `next()`，
+     插件自己的逻辑失败时也只 warn 一次、绝不重复调用下游。
      （凭据轮换插件仍然返回 `{kind:'retry'}`：换 key 不换路由，重试是有效的。）
 
 `planRoute(current)` 的规则：
@@ -254,12 +261,18 @@ agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
 2. **cn 的 5 小时窗口用尽** ⇒ cn 被判为耗尽 ⇒ 跳过 cn ⇒ 走 max。
    冷却时长取「各窗口重置时间的**较晚者**」（`lib/quota.js` 的 `resetAt`）：只有 5 小时窗口用尽时，
    就是 5 小时窗口的重置时间；周窗口也用尽时，就是周窗口的重置时间。
-3. **5 小时窗口恢复** ⇒ 读取器读到 cn 剩余 > 0 ⇒ 耗尽判定消失 ⇒ cn 重新健康 ⇒
-   **下一次选路优先切回 cn**。
+3. **5 小时窗口恢复** ⇒ 读取器读到 cn 剩余 > 0 ⇒ 耗尽判定消失 ⇒ cn 重新成为候选 ⇒
+   **下一次选路优先切回 cn**——但还要等插件自己的冷却到期（见第 5 条）。
 4. **cn 的周窗口也用尽** ⇒ 耗尽判定继续成立（**任一窗口为 0 即耗尽**）⇒
    即使 5 小时窗口恢复也**不再切回 cn**，直到周窗口重置。
-5. **判定只看额度读取器，不看插件的冷却表**：读取器每 60 秒预读一次（TTL 5 分钟）；
-   插件进程重启后冷却表清空，但读取器的判定仍在 ⇒ 重启前后行为一致。
+5. **判定有两个来源，缺一不可**：额度读取器（额度用尽）与插件自己的冷却表（失败后的冷却）。
+   一条路由只要被其中任何一方判定为不可用，选路就会跳过它：
+   - 读取器每 60 秒预读一次（TTL 5 分钟），**它的缓存同样在进程内**；
+   - 冷却表的时长取「额度窗口剩余时间」与「固定冷却 `cooldownMs`（默认 10 分钟）」中**更长的那个**
+     （`RATE_LIMIT` 走 60 秒短冷却）。所以冷却到期不会早于额度窗口重置，窗口在 10 分钟内恢复时，
+     回切会被冷却表推迟到 10 分钟之后。
+   - 插件重启后**两个判定一起清空**：额度刚用尽时重启，那之后的第一个请求可能再失败一次，
+     直到读取器重新读到数据。
 6. **读不到就不阻断**：`exhausted()` 只承认「确认读到」的结果。读不到（凭据缺失 / 网络不通）
    按「未耗尽」处理，回落到固定冷却 `cooldownMs`（默认 10 分钟）。
    **此时第 3、4 条不成立**——「5 小时才回 cn」依赖能读到额度数据。
@@ -276,7 +289,8 @@ agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
 |---|---|
 | 1 / 3 / 4 / 8 | `lib/route-pool.js` 的 `planRoute()` / `preferredRoute()` / `nextHealthyRoute()` |
 | 2 | `lib/quota.js` 的 `summarizeEntry()`（`exhausted` / `resetAt`）→ `lib/route-pool.js` 的 `quotaCooldown()` |
-| 5 / 6 | `lib/quota.js` 的 `read()` / `cached()` / `exhausted()`；预读循环在 `index.js` 的 quota refresher |
+| 5 | 读取器：`lib/quota.js` 的 `read()` / `cached()` / `exhausted()`（预读循环在 `index.js`）；冷却表：`lib/route-pool.js` 的 `coolingUntil` / `isCooling()`，时长在 `onRequestError()` 里取「窗口剩余」与「固定冷却」的较大者 |
+| 6 | `lib/quota.js` 的 `exhausted()` 只承认确认读到的结果；`lib/route-pool.js` 的 `quotaCooldown()` 读不到时返回 undefined ⇒ 固定冷却 |
 | 7 | `lib/route-pool.js` 的三个钩子（`agent/inbox/inserted` / `agent/pre-step` / `agent/request-error`） |
 
 ### 怎么确认这套规则真的生效
@@ -284,6 +298,7 @@ agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
 - 面板额度页（`GET /api/keypool/quota`）能看到 cn / max 的 5 小时与周窗口读数 ⇒ 读取器通了，
   第 2–4 条成立；
 - 额度页读不到（`ok: false`）⇒ 只能靠失败后的固定冷却，第 3、4 条不成立；
+- 额度页能读、但回切比窗口重置晚了 10 分钟以内 ⇒ 冷却表在起作用（第 5 条），不是读取器坏了；
 - 切路由时对话里会出现内核自动插入的 `[model changed: …]`。
 
 ## 4. 交付标准
