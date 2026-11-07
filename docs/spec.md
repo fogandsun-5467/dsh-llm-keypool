@@ -60,18 +60,26 @@
 | 文件 | 负责人 | 说明 |
 |---|---|---|
 | `lib/shared.js` | Lead（已完成） | 配额判断、预算、配置校验。**不要改** |
-| `test/helpers/fake-ctx.mjs` | Lead（已完成） | 伪 Cordis ctx / 凭据服务 / payload 构造。**不要改** |
+| `test/helpers/fake-ctx.mjs` | 维护者 | 伪 Cordis ctx / 凭据服务 / payload 构造。0.2.2-rc.1 迁移时补了 agent 桩（`createFakeAgent` 等） |
 | `lib/key-rotate.js` | key-rotate-dev | 插件 B（凭据轮换） |
 | `test/key-rotate.test.mjs` | key-rotate-dev | B 的单元测试 |
 | `lib/route-pool.js` | route-pool-dev | 插件 C（路由池 fallback） |
 | `test/route-pool.test.mjs` | route-pool-dev | C 的单元测试 |
-| `package.json` / `cordis.patch.yml` / `docs/spec.md` | Lead | 不要改 |
+| `package.json` / `cordis.patch.yml` / `docs/spec.md` | 维护者 | 0.2.2-rc.1 迁移时改了 `package.json`（版本、`engines.dsh`）与本文件 |
+
+> 「不要改」是上一轮并行开发时的边界。0.2.2-rc.1 迁移（内核把路由固定在步骤准备时）由维护者一人完成，
+> 动过的文件已在表里逐行注明——`lib/shared.js` 与 `lib/key-rotate.js` 至今未动。
 
 测试命令（在项目根目录）：
 
 ```powershell
-& node --test test/key-rotate.test.mjs
-& node --test test/route-pool.test.mjs
+& node --test
+```
+
+只想跑两个插件的用例时：
+
+```powershell
+& node --test test/key-rotate.test.mjs test/route-pool.test.mjs
 ```
 
 `package.json` 是 `"type": "module"`；用 ESM + `node:test` + `node:assert/strict`。
