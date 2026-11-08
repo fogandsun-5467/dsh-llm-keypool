@@ -18,7 +18,8 @@
    监听器若返回 `{ kind: 'retry' }`，agent loop 会在**同一轮、同一步**重跑失败步骤；
    若返回 `undefined`（或不返回），由下游/终态处理，轮次以该失败结束。
    **重试会重新解析凭据**（同一路由），所以换 key 仍然靠 `{kind:'retry'}` 生效；
-   但**重试不会换路由**——0.2.2 的路由在步内是冻结的。
+   **重试本身不会换路由**——0.2.2 的路由在步内是冻结的。但重试用的就是本步那个
+   selection 对象（见 §0.2 第 2 条），插件在要求重试**之前**把它改写掉，重试就落在新路由上。
 
 2. **0.2.2 起路由在步内冻结**：agent 在「提示词组装 + pre-step」之前就固定了本步的
    provider/model/reasoning effort（`dsh-agent-loop/lib/index.js` 的 `preStep()`：
@@ -30,12 +31,18 @@
    - 换路由的唯一入口是 **`agent.model.select({ provider, model, reasoningEffort? })`**：
      它给「**尚未开始准备的下一步**」定下完整选择；`agent.model.current()` 读回当前选择
      （pending → 最近一次请求 → agent.options）。
+   - **步内换路的缝隙**：本步的 selection 对象会原样出现在 `agent/pre-step` 的 payload 里
+     （`modelSelection`），内核每次 attempt 都从这个对象重新 seed 请求
+     （`dsh-agent-loop/lib/index.js:841-842` 的 `while (true)` + `:990-993` 的
+     `structuredClone({...controls, ...selection})`）。而 `agent.model.current()` 返回的是
+     **副本**（`dsh-agent/lib/types/model-selection.js:84`），所以插件**就地改写**
+     `payload.modelSelection` 只影响本步：改完再返回 `{kind:'retry'}`，重试就落在新路由上。
    - **三个可用的时机**：
      | 时机 | 事件 | 选中的路由对哪一步生效 |
      |---|---|---|
      | 消息落进收件箱、驱动还没醒 | `agent/inbox/inserted`（payload `{ agent, message }`） | **尚未开始准备的下一步**（通常就是本轮第一步） |
      | 本步路由已固定 | `agent/pre-step`（payload 含 `modelSelection`） | **下一步** |
-     | 本步请求失败 | `agent/request-error` | **下一步** |
+     | 本步请求失败 | `agent/request-error` | **本步**（就地改写 `modelSelection` 后 `{kind:'retry'}`）+ **下一步** |
    - `agent/inbox/inserted` 在 `ReactLoopInbox.mutate()` 里于 `session.append('agent/inbox/spliced')`
      之后同步 emit，早于 `wakeDriver()`；此时 `agent.model.select()` 安全（不会撞上
      "session append cannot reenter while another append is being published"）。
@@ -180,10 +187,13 @@ dryRun: false                      # 可选：true 时只打日志、不记录�
 ### 运行时行为
 
 状态：`Map<provider, cooldownUntilMs>`（闭包级，apply 每次重新初始化）+ `routesByAgent`（WeakMap，
-agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
-`SwitchBudget` 用于按 agent+turn 限制切换次数。
+agent → 本步固定的 `{ route, pool, selection }`，由 `agent/pre-step` 填；`selection` 是载荷里那个
+**活对象**，失败时靠它把本步挪到健康路由）+ `truthByProvider`（Map，provider → 最近一次厂商裁决
+及其时间戳）。两个 `SwitchBudget`：`budget` 按 agent+turn 限制**换路**次数，`retryBudget` 限制
+**同路重试**次数——宿主的 `while (true)` 没有次数上限，插件必须自带上限。
 
-**三个钩子，都用 `agent.model.select()` 选路，绝不改写 `agent/request`：**
+**三个钩子，绝不改写 `agent/request`；为下一步选路用 `agent.model.select()`，
+为**本步**选路就地改写 `agent/pre-step` 载荷里的 `modelSelection`：**
 
 1. **`agent/inbox/inserted`**（payload `{ agent, message }`）——为**尚未开始准备的下一步**选路：
    消息落进收件箱时驱动还没醒，选中的路由就是本轮第一步；内核把工具结果拼进收件箱时
@@ -196,20 +206,34 @@ agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
    ```
 2. **`agent/pre-step`**（payload 含 `modelSelection`）——本步路由已固定：
    - 先 `await next()`，**原样返回 decision**（不改消息、不拒绝步骤）；
-   - 用 `modelSelection` 记住本步路由（`routesByAgent.set(agent, {route, pool})`；
-     不在池里就 `routesByAgent.delete(agent)`）；
+   - 用 `modelSelection` 记住本步路由（`routesByAgent.set(agent, {route, pool, selection})`；
+     不在池里就 `routesByAgent.delete(agent)`）；`selection` 存的是**载荷里的那个活对象**
+     （不是副本），失败时靠它把本步挪到健康路由；
    - 再按 `planRoute` 为**下一步**选路。
-3. **`agent/request-error`**（非 prepend）——本步失败：
-   - `failure` 不匹配（`matchesFailure`）→ `next()`；
-   - 归因失败路由：先看 `routesByAgent.get(agent)`（provider 必须一致），
-     否则回退到「provider 在池中唯一」的匹配；都不中 → `next()`；
-   - 预算 `budget.take(agent, turn, maxSwitchesPerTurn)` 失败 → `next()`；
-   - 标记当前 provider 冷却（`RATE_LIMIT` 用 60 秒短冷却；其余用「额度窗口剩余时间」与
+3. **`agent/request-error`**（**prepend**——池子先判，判得出动作就不交给下游）——本步失败：
+   - **失败分三类**：
+     - **点名额度**（`matchesFailure(failure, { codes, regexes })` 命中 `DEFAULT_CODES`/
+       `DEFAULT_PATTERNS`，如 `QUOTA`/`ACCOUNT_QUOTA`/`RATE_LIMIT` 或中文「余额不足」）→ 直接判死路；
+     - **形态不明**（命中 `DEFAULT_AMBIGUOUS_CODES`/`DEFAULT_AMBIGUOUS_PATTERNS`，如
+       `TIMEOUT`/`TRANSPORT`/`SERVER`、超时、断连）→ **先问厂商真相**：
+       `quota.inspect(provider)` 强制刷新额度（有界超时 `truthTimeoutMs`，默认 3 秒）：
+       - 厂商说耗尽 → 判死路；
+       - 厂商说还有余量、或答不上来 → 视为瞬时故障，**同路有限重试**（`retryBudget` 限次，
+         默认 `transientRetries`=2 次，间隔 `retryDelayMs` 起、`retryMaxDelayMs` 封顶），
+         返回 `{kind:'retry'}`；同路重试用尽 → `next()`，让失败照常冒泡；
+     - 其它 → `next()`（不归池子管）。
+   - 判死路后：归因失败路由（先看 `routesByAgent.get(agent)`，provider 必须一致；
+     否则回退到「provider 在池中唯一」的匹配；都不中 → `next()`）；
+     预算 `budget.take(agent, turn, maxSwitchesPerTurn)` 失败 → `next()`；
+     标记当前 provider 冷却（`RATE_LIMIT` 用 60 秒短冷却；其余用「额度窗口剩余时间」与
      「固定冷却 `cooldownMs`」中更长的那个，读不到额度就只按固定冷却；`dryRun` 时跳过），
-     `logger.warn`；
-   - 为**下一步**选好下一条健康路由（`selectRoute`）；
-   - **`return next()`**——不返回 `{kind:'retry'}`：步内路由被冻结，重试只会再撞同一条死路由；
-     让失败照常冒泡，同时把下一步的路由准备好。下游（凭据轮换）拿到的就是这一次 `next()`，
+     `logger.warn`；取下一条健康路由（`nextHealthyRoute`，没有就 warn 并放行失败）；
+   - **就地改写本步的 `modelSelection`**（`switchStepTo`：换 provider/model；换了 model 就
+     `delete selection.reasoningEffort`），**再返回 `{kind:'retry'}`**——宿主在同一个轮、
+     同一步上用新路由重跑（`dsh-agent-loop/lib/index.js:841-842` 复用同一个
+     `decision.selection` 对象，`:990-993` 每次 attempt 重新 seed）；
+   - 同时为**下一步**选好下一条健康路由（`selectRoute`）；
+   - **只调一次 `next()`**：池子判出动作就返回动作（不调 `next()`）；判不出才 `next()`。
      插件自己的逻辑失败时也只 warn 一次、绝不重复调用下游。
      （凭据轮换插件仍然返回 `{kind:'retry'}`：换 key 不换路由，重试是有效的。）
 
@@ -231,8 +255,8 @@ agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
 1. 插件**不改写** `agent/request`：失败之后请求配置原样返回。
 2. `agent/inbox/inserted` → `agent.model.select()` 被调用，选的是下一条健康路由（额度用尽时）。
 3. `agent/pre-step` → decision 原样返回，且为**下一步**选好路由。
-4. `agent/request-error` → provider 被冷却、状态面板记录切换与失败、且**返回下游的终态**
-   （不是 `{kind:'retry'}`）。
+4. `agent/request-error` → provider 被冷却、状态面板记录切换与失败；**本步**的
+   `modelSelection` 被就地改写到健康路由，并返回 `{kind:'retry'}`（而不是把失败原样冒泡）。
 5. 连续失败两把路由 → 依次选到第二、第三条；三把都冷却后不再选（交给失败）。
 6. `route.model` 覆盖生效（选中的 `model` 被替换；未配置时保持不变）。
 7. 非配额失败不触发、不冷却。
@@ -241,6 +265,8 @@ agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
 10. 不在池中的 provider 不受影响（既不选路也不冷却）。
 11. `preferFirst`：池序即偏好；额度用尽的第一条被跳过；只同模型换路由。
 12. GUI 配置文件（`$DSH_HOME/keypool/route-pool.json`）里的池子/开关/触发码优先于 row 配置。
+13. 形态不明的失败（超时）：厂商确认耗尽 → 换路重跑；厂商不确认 → 同路重试，不烧掉一条路由。
+14. 宿主循环没有次数上限：同路重试与换路各自受预算约束，不会无限重试。
 
 ## 3.1 额度窗口与回切规则（cn → max → 回切 cn）
 
@@ -268,6 +294,8 @@ agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
 5. **判定有两个来源，缺一不可**：额度读取器（额度用尽）与插件自己的冷却表（失败后的冷却）。
    一条路由只要被其中任何一方判定为不可用，选路就会跳过它：
    - 读取器每 60 秒预读一次（TTL 5 分钟），**它的缓存同样在进程内**；
+     额度刚用尽的瞬间，池子看到的可能还是「还剩 1%-3%」——所以失败发生的那一刻，
+     池子会**强制刷新一次**（`quota.inspect` 不吃缓存）来问厂商真相；
    - 冷却表的时长取「额度窗口剩余时间」与「固定冷却 `cooldownMs`（默认 10 分钟）」中**更长的那个**
      （`RATE_LIMIT` 走 60 秒短冷却）。所以冷却到期不会早于额度窗口重置，窗口在 10 分钟内恢复时，
      回切会被冷却表推迟到 10 分钟之后。
@@ -276,10 +304,15 @@ agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
 6. **读不到就不阻断**：`exhausted()` 只承认「确认读到」的结果。读不到（凭据缺失 / 网络不通）
    按「未耗尽」处理，回落到固定冷却 `cooldownMs`（默认 10 分钟）。
    **此时第 3、4 条不成立**——「5 小时才回 cn」依赖能读到额度数据。
-7. **切换落在下一步/下一轮**：0.2.2 步内路由冻结，额度用尽后切到 max 是「下一步」的事。
-   由于读取器提前预读，正常情况下请求还没发出就已换走，用户看不到报错；
-   只有额度刚用尽、读取器还没刷新（≤ TTL）时，第一个请求会失败并把错误冒泡，
-   从下一轮起走 max。
+7. **切换先落在本步，再落到下一步**：读取器提前预读，正常情况下请求还没发出就已换走，
+   用户看不到报错；只有额度刚用尽、读取器还没刷新（≤ TTL）时，第一个请求会失败。
+   此时池子**先问厂商真相**（`quota.inspect`，强制刷新、有界超时）再判决：
+   - 厂商确认耗尽 → **就地改写本步的 `modelSelection`** 并 `{kind:'retry'}`，
+     同一个轮、同一步在 max 上重跑（`dsh-agent-loop/lib/index.js:841-842`、`:990-993`），
+     本轮不再以失败告终；顺便为**下一步**选好路。
+   - 厂商不确认（还有余量 / 答不上来）→ 当作瞬时故障，**同路有限重试**（默认 2 次），
+     不浪费一条路由。
+   - 厂商接口不可用 → 同上按瞬时故障处理，不凭空切路。
 8. **同模型约束**：`preferFirst` 只在同模型之间回切（`preferredRoute` 要求
    `candidate.model === resolved.model`）。cn 与 max 的 model id 必须一致，否则不回切。
 
@@ -291,7 +324,8 @@ agent → 本步固定的 `{ route, pool }`，由 `agent/pre-step` 填）。
 | 2 | `lib/quota.js` 的 `summarizeEntry()`（`exhausted` / `resetAt`）→ `lib/route-pool.js` 的 `quotaCooldown()` |
 | 5 | 读取器：`lib/quota.js` 的 `read()` / `cached()` / `exhausted()`（预读循环在 `index.js`）；冷却表：`lib/route-pool.js` 的 `coolingUntil` / `isCooling()`，时长在 `onRequestError()` 里取「窗口剩余」与「固定冷却」的较大者 |
 | 6 | `lib/quota.js` 的 `exhausted()` 只承认确认读到的结果；`lib/route-pool.js` 的 `quotaCooldown()` 读不到时返回 undefined ⇒ 固定冷却 |
-| 7 | `lib/route-pool.js` 的三个钩子（`agent/inbox/inserted` / `agent/pre-step` / `agent/request-error`） |
+| 7 | `lib/route-pool.js` 的三个钩子（`agent/inbox/inserted` / `agent/pre-step` / `agent/request-error`）；步内换路在 `switchStepTo()`（就地改写 `modelSelection`）+ `reactToFailure()` 返回 `{kind:'retry'}` |
+| 厂商真相 | `lib/quota.js` 的 `inspect()`（强制刷新、有界超时、tri-state）+ `lib/route-pool.js` 的 `askTheVendor()`（记忆 `truthByProvider`，TTL `truthTtlMs`）；接线在 `index.js` 的 `quota.inspect` 钩子 |
 
 ### 怎么确认这套规则真的生效
 

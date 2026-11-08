@@ -11,6 +11,17 @@
 #    because rotating credentials needs an explicit opt-in.
 #
 # The row `id` is the config namespace: keep it `llm-keypool`.
+#
+# The host's `dsh-llm-retry` is disabled here: it retries the SAME route on the
+# SAME key, so a spent quota just burns the retry budget on the dead route and
+# hides the failure from this bundle. The pool needs to see the failure first:
+# it asks the vendor for the truth, moves the running step onto a healthy
+# route, and retries in place with its own budget. Remove the disable entry
+# below if you prefer to keep the host's retries and give up the in-step
+# failover.
+- id: llm-retry
+  name: '@deepseek-ai/dsh-llm-retry'
+  disabled: true
 - insert:
     - id: llm-keypool
       name: '@nethiel/dsh-llm-keypool'

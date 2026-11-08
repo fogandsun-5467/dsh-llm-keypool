@@ -359,6 +359,24 @@ export function apply(ctx, config = {}) {
           }
           return quotaService.cooldownMs(provider)
         },
+        // The truth about a provider, asked right now. A failure that only
+        // looks like a timeout is not a verdict: the pool asks the vendor
+        // before it takes a route out of rotation. The reader's cache is
+        // bypassed on purpose — a cached reading may predate the failure.
+        inspect: async (provider, options = {}) => {
+          if (!quotaEnabled || guiQuota().enabled === false) return { ok: false, exhausted: undefined }
+          const gui = guiQuota()
+          try {
+            return await quotaService.inspect(provider, {
+              guiProviders: gui.providers ?? {},
+              timeoutMs: options.timeoutMs,
+            })
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            ctx.logger.warn(`llm-keypool: quota inspect after failure failed: ${message}`)
+            return { ok: false, exhausted: undefined }
+          }
+        },
       },
     })
   } catch (error) {

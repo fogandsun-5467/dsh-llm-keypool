@@ -96,20 +96,23 @@ test('a step that runs on a spent quota hands the next step to the next route', 
   assert.deepEqual(agent.selections, [{ provider: 'route-b', model: 'deepseek-flash' }])
 })
 
-test('a failed request cools the provider and hands the next step a healthy route', async () => {
+test('a failed request cools the provider and moves the running step to a healthy route', async () => {
   const { dispatch } = setup()
   const agent = agentOn('route-a')
   // The step fixed route-a and the request failed with a spent quota.
+  const selection = { provider: 'route-a', model: 'deepseek-flash' }
   await dispatch(
     'agent/pre-step',
-    preStepPayload(agent, { provider: 'route-a', model: 'deepseek-flash' }),
+    preStepPayload(agent, selection),
     async () => ({ kind: 'enter', messages: [] }),
   )
   const action = await fail(dispatch, { provider: 'route-a', agent })
-  // The route of a step is fixed, so a retry would hit the same dead route
-  // again. The pool lets the failure travel downstream and speaks for the
-  // next step instead.
-  assert.equal(action, TERMINAL)
+  // The host re-prepares the request from the step's own selection object, so
+  // the pool moves that object onto the healthy route and asks for a retry.
+  // The retry then runs on route-b instead of the dead route-a.
+  assert.deepEqual(action, { kind: 'retry' })
+  assert.deepEqual(selection, { provider: 'route-b', model: 'deepseek-flash' })
+  // The next step keeps the healthy route as well.
   assert.deepEqual(agent.selections, [{ provider: 'route-b', model: 'deepseek-flash' }])
 })
 

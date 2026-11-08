@@ -59,7 +59,7 @@
     "access": "public"
   },
   "scripts": {
-    "test": "node --test test/key-rotate.test.mjs test/route-pool.test.mjs test/runtime.test.mjs test/panel-api.test.mjs test/client-module.test.mjs test/quota.test.mjs"
+    "test": "node --test test/key-rotate.test.mjs test/route-pool.test.mjs test/turn-failover.test.mjs test/runtime.test.mjs test/panel-api.test.mjs test/client-module.test.mjs test/quota.test.mjs"
   },
   "dsh": {
     "bundle": {
