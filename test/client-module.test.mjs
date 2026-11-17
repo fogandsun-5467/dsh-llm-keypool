@@ -93,3 +93,20 @@ test('browser half is a lazy module factory, not a side-effecting page', () => {
   // No DOM work at module load: document.body must be untouched by the factory.
   assert.deepEqual(Object.keys(client).sort(), ['apply', 'inject'])
 })
+
+test('panel endpoints are addressed relative to the page, not from the origin root', () => {
+  // A deployment may serve the GUI behind a path prefix (for example fnOS's
+  // "/app/Harness/dsh" iframe). The page carries `<base href="./">`, so a
+  // relative API path stays under that prefix; an absolute "/api/keypool/"
+  // leaves the app and the gateway answers with its own HTML, which fails the
+  // JSON read. The Host's own clients resolve the same way.
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  assert.ok(
+    source.includes("const API = 'api/keypool/'"),
+    'the API base must be a relative path',
+  )
+  assert.ok(
+    !source.includes("const API = '/api/keypool/'"),
+    'an absolute API base breaks a prefixed deployment',
+  )
+})
