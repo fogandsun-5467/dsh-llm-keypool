@@ -29,10 +29,6 @@
     "node": ">=22.12.0",
     "dsh": ">=0.2.2-rc.1"
   },
-  "peerDependencies": {
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0"
-  },
   "exports": {
     ".": "./index.js",
     "./client": "./lib/client.js",
@@ -58,6 +54,9 @@
   "publishConfig": {
     "access": "public"
   },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.1.0"
+  },
   "scripts": {
     "test": "node --test test/key-rotate.test.mjs test/route-pool.test.mjs test/turn-failover.test.mjs test/runtime.test.mjs test/panel-api.test.mjs test/client-module.test.mjs test/quota.test.mjs"
   },
@@ -73,7 +72,9 @@
     },
     "compatibility": {
       "dshReleases": {
-        "0.2.2-rc.1": "compatible"
+        "0.2.2-rc.1": "compatible",
+        "0.2.2-rc.2": "compatible",
+        "0.2.2-rc.3": "compatible"
       }
     }
   }

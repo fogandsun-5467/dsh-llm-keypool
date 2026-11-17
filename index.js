@@ -244,9 +244,14 @@ export function apply(ctx, config = {}) {
           }
           catalog.push({
             provider: provider.id,
-            displayName: typeof provider.displayName === 'string' && provider.displayName !== ''
-              ? provider.displayName
-              : provider.id,
+            // DSH 0.2.2-rc.3 renamed `LlmProviderInfo.displayName` to `name`;
+            // older cores exposed the display name under `displayName`. Read
+            // both so the panel shows a friendly label on either version.
+            displayName: typeof provider.name === 'string' && provider.name !== ''
+              ? provider.name
+              : (typeof provider.displayName === 'string' && provider.displayName !== ''
+                  ? provider.displayName
+                  : provider.id),
             models: Array.isArray(models) ? models.map(modelEntry) : [],
           })
         }

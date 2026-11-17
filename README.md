@@ -56,6 +56,13 @@ dsh plugin --profile web add github:fogandsun-5467/dsh-llm-keypool
 > provider/model/reasoning effort，`agent/request` 不再允许改路由（改了内核会直接抛错）。
 > 路由池因此改为通过 `agent.model.select()` 选路，只在 0.2.2-rc.1 及以后的内核上工作。
 
+已在本机 DSH **0.2.2-rc.3** 上验证：插件加载正常，四个面板端点
+（`/api/keypool/catalog|config|status|quota`）全部 200，额度读取能读到供应商的 5 小时 / 周窗口剩余额度。
+
+> **0.2.2-rc.3 的接口变动已适配。** rc.3 把 `LlmProviderInfo.displayName` 改名为 `name`，
+> 面板的供应商显示名因此改为「先读 `name`，再回退 `displayName`，最后回退路由键」，
+> 两个版本的内核都能显示友好名称。
+
 ### 与内核自带的 `dsh-llm-retry` 的关系
 
 内核自带的 `dsh-llm-retry` 只在**同一条路由、同一把 key** 上重试：额度用尽时它会把重试预算

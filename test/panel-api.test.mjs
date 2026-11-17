@@ -106,6 +106,29 @@ test('catalog lists every provider with its models', async () => {
   })
 })
 
+test('catalog reads the provider display label from `name` (DSH 0.2.2-rc.3) and `displayName` (older cores)', async () => {
+  // DSH 0.2.2-rc.3 renamed `LlmProviderInfo.displayName` to `name`; older
+  // cores expose only `displayName`. The catalog must label a provider in
+  // both shapes and fall back to the route key when neither carries a label.
+  const ctx = createCtx({
+    llm: {
+      listProviders: () => [
+        { id: 'vendor-new', name: '供应商 New' },
+        { id: 'vendor-old', displayName: '供应商 Old' },
+        { id: 'vendor-bare' },
+      ],
+      listModels: async () => [],
+    },
+  })
+  apply(ctx, {})
+  const result = await exchange('GET').invoke(ctx.routes.get('/api/keypool/catalog'))
+  assert.equal(result.status, 200)
+  assert.deepEqual(
+    result.body.providers.map((provider) => provider.displayName),
+    ['供应商 New', '供应商 Old', 'vendor-bare'],
+  )
+})
+
 test('config GET falls back to the row config, POST writes the pool file', async () => {
   const ctx = createCtx({ llm: providerService })
   apply(ctx, { pools: [], cooldownMs: 600000, maxSwitchesPerTurn: 3 })
